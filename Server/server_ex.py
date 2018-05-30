@@ -5,9 +5,11 @@ from gevent.server import StreamServer
 from collections import namedtuple
 from io import BytesIO
 from socket import error as socket_error
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-# We'll use exceptions to notify the connection-handling loop of problems.
 class CommandError(Exception): pass
 
 
@@ -25,8 +27,7 @@ class ProtocolHandler(object):
             ':': self.handle_integer,
             '$': self.handle_string,
             '*': self.handle_array,
-            '%': self.handle_dict
-        }
+            '%': self.handle_dict}
 
     def handle_request(self, socket_file):
         first_byte = socket_file.read(1)
@@ -34,7 +35,7 @@ class ProtocolHandler(object):
             raise Disconnect()
 
         try:
-            # Delegate to the appropiate handler based on the first byte.
+            # Delegate to the appropriate handler based on the first byte.
             return self.handlers[first_byte](socket_file)
         except KeyError:
             raise CommandError('bad request')
@@ -73,15 +74,16 @@ class ProtocolHandler(object):
         socket_file.write(buf.getvalue())
         socket_file.flush()
 
-    def write(self, buf, data):
+    def _write(self, buf, data):
         if isinstance(data, str):
             data = data.encode('utf-8')
+
         if isinstance(data, bytes):
             buf.write('$%s\r\n%s\r\n' % (len(data), data))
         elif isinstance(data, int):
             buf.write(':%s\r\n' % data)
         elif isinstance(data, Error):
-            buf.write('-%s\r\n' % Error.message)
+            buf.write('-%s\r\n' % error.message)
         elif isinstance(data, (list, tuple)):
             buf.write('*%s\r\n' % len(data))
             for item in data:
@@ -117,8 +119,31 @@ class Server(object):
             'DELETE': self.delete,
             'FLUSH': self.flush,
             'MGET': self.mget,
-            'MSET': self.mset
-        }
+            'MSET': self.mset}
+
+    def connection_handler(self, conn, address):
+        logger.info('Connection received: %s:%s' % address)
+        # Convert "conn" (a socket object) into a file-like object.
+        socket_file = conn.makefile('rwb')
+
+        # Process client requests until client disconnects.
+        while True:
+            try:
+                data = self._protocol.handle_request(socket_file)
+            except Disconnect:
+                logger.info('Client went away: %s:%s' % address)
+                break
+
+            try:
+                resp = self.get_response(data)
+            except CommandError as exc:
+                logger.exception('Command error')
+                resp = Error(exc.args[0])
+
+            self._protocol.write_response(socket_file, resp)
+
+    def run(self):
+        self._server.serve_forever()
 
     def get_response(self, data):
         if not isinstance(data, list):
@@ -133,6 +158,8 @@ class Server(object):
         command = data[0].upper()
         if command not in self._commands:
             raise CommandError('Unrecognized command: %s' % command)
+        else:
+            logger.debug('Received %s', command)
 
         return self._commands[command](*data[1:])
 
@@ -163,35 +190,8 @@ class Server(object):
             self._kv[key] = value
         return len(data)
 
-    def connection_handler(self, conn, address):
-        # Convert "conn" (a socket object) into a file-like object.
-        socket_file = conn.makefile('rwb')
-
-        # Process client requests until client disconnects.
-        while True:
-            try:
-                data = self._protocol.handle_request(socket_file)
-            except Disconnect:
-                break
-
-            try:
-                resp = self.get_response(data)
-            except CommandError as exc:
-                resp = Error(exc.args[0])
-
-            self._protocol.write_response(socket_file, resp)
-
-    def run(self):
-        self._server.serve_forever()
-
 
 class Client(object):
-    # Add this to bottom of module:
-    if __name__ == '__main__':
-        from gevent import monkey;
-        monkey.patch_all()
-        Server().run()
-
     def __init__(self, host='127.0.0.1', port=31337):
         self._protocol = ProtocolHandler()
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -222,3 +222,12 @@ class Client(object):
 
     def mset(self, *items):
         return self.execute('MSET', *items)
+
+
+if __name__ == '__main__':
+    from gevent import monkey;
+
+    monkey.patch_all()
+    logger.addHandler(logging.StreamHandler())
+    logger.setLevel(logging.DEBUG)
+    Server().run()
